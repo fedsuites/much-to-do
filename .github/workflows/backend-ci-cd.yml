@@ -134,32 +134,12 @@ jobs:
           aws-region: ${{ secrets.AWS_REGION }}
 
       - name: Deploy to ASG via rolling update
-        env:
-          IMAGE_URI: ${{ needs.build.outputs.image_uri }}
         run: |
-          USERDATA=$(cat scripts/deploy-backend.sh | \
-            sed "s|IMAGE_URI_PLACEHOLDER|$IMAGE_URI|g" | \
-            base64 -w 0)
-
-          aws ec2 create-launch-template-version \
-            --launch-template-name starttech-backend-lt \
-            --source-version '$Latest' \
-            --launch-template-data "{\"UserData\":\"$USERDATA\"}"
-
-          LATEST_VERSION=$(aws ec2 describe-launch-template-versions \
-            --launch-template-name starttech-backend-lt \
-            --query 'LaunchTemplateVersions[-1].VersionNumber' \
-            --output text)
-
-          aws ec2 modify-launch-template \
-            --launch-template-name starttech-backend-lt \
-            --default-version $LATEST_VERSION
-
           REFRESH_ID=$(aws autoscaling start-instance-refresh \
             --auto-scaling-group-name starttech-backend-asg \
             --preferences '{
               "MinHealthyPercentage": 50,
-              "InstanceWarmup": 60
+              "InstanceWarmup": 120
             }' \
             --query 'InstanceRefreshId' \
             --output text)
@@ -174,10 +154,10 @@ jobs:
               --output text)
             echo "Refresh status: $STATUS"
             if [ "$STATUS" = "Successful" ]; then
-              echo " Rolling update completed successfully"
+              echo "Rolling update completed successfully"
               break
             elif [ "$STATUS" = "Failed" ] || [ "$STATUS" = "Cancelled" ]; then
-              echo " Rolling update failed: $STATUS"
+              echo "Rolling update failed: $STATUS"
               exit 1
             fi
             sleep 20
