@@ -48,9 +48,8 @@ jobs:
 
       - name: Run unit tests
         run: |
-          go test ./... -v -short \
-            -coverprofile=coverage.out \
-            -covermode=atomic
+          go test ./... -v -short 
+            
         env:
           INTEGRATION: false
 
