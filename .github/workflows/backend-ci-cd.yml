@@ -1,0 +1,209 @@
+name: Backend CI/CD
+
+on:
+  push:
+    branches: [feature/full-stack]
+    paths:
+      - 'Server/**'
+      - '.github/workflows/backend-ci-cd.yml'
+  pull_request:
+    branches: [feature/full-stack]
+    paths:
+      - 'Server/**'
+
+env:
+  GO_VERSION: '1.22'
+  ECR_REPOSITORY: starttech-backend
+
+jobs:
+  test:
+    name: Test & Quality Checks
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: Server/MuchToDo
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: Server/MuchToDo/go.sum
+
+      - name: Install dependencies
+        run: go mod download
+
+      - name: Run go vet
+        run: go vet ./...
+
+      - name: Install staticcheck
+        run: go install honnef.co/go/tools/cmd/staticcheck@latest
+
+      - name: Run staticcheck
+        run: staticcheck ./...
+        continue-on-error: true
+
+      - name: Run unit tests
+        run: |
+          go test ./... -v -short \
+            -coverprofile=coverage.out \
+            -covermode=atomic
+        env:
+          INTEGRATION: false
+
+      - name: Run integration tests
+        run: |
+          go test ./... -v -run Integration \
+            -timeout 120s
+        env:
+          INTEGRATION: true
+
+      - name: Run vulnerability scan
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...
+        continue-on-error: true
+
+  build:
+    name: Build & Push Docker Image
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.ref == 'refs/heads/feature/full-stack' && github.event_name == 'push'
+    outputs:
+      image_uri: ${{ steps.build-image.outputs.image_uri }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build Docker image
+        id: build-image
+        working-directory: Server/MuchToDo
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          IMAGE_URI=$ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+          docker build -t $IMAGE_URI .
+          echo "image_uri=$IMAGE_URI" >> $GITHUB_OUTPUT
+
+      - name: Scan Docker image for vulnerabilities
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ steps.build-image.outputs.image_uri }}
+          format: 'table'
+          exit-code: '0'
+          severity: 'CRITICAL,HIGH'
+
+      - name: Push Docker image to ECR
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          docker push ${{ steps.build-image.outputs.image_uri }}
+          docker tag ${{ steps.build-image.outputs.image_uri }} \
+            $ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:latest
+          docker push $ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:latest
+
+  deploy:
+    name: Deploy to EC2 via Rolling Update
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/feature/full-stack' && github.event_name == 'push'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Deploy to ASG via rolling update
+        env:
+          IMAGE_URI: ${{ needs.build.outputs.image_uri }}
+        run: |
+          USERDATA=$(cat scripts/deploy-backend.sh | \
+            sed "s|IMAGE_URI_PLACEHOLDER|$IMAGE_URI|g" | \
+            base64 -w 0)
+
+          aws ec2 create-launch-template-version \
+            --launch-template-name starttech-backend-lt \
+            --source-version '$Latest' \
+            --launch-template-data "{\"UserData\":\"$USERDATA\"}"
+
+          LATEST_VERSION=$(aws ec2 describe-launch-template-versions \
+            --launch-template-name starttech-backend-lt \
+            --query 'LaunchTemplateVersions[-1].VersionNumber' \
+            --output text)
+
+          aws ec2 modify-launch-template \
+            --launch-template-name starttech-backend-lt \
+            --default-version $LATEST_VERSION
+
+          REFRESH_ID=$(aws autoscaling start-instance-refresh \
+            --auto-scaling-group-name starttech-backend-asg \
+            --preferences '{
+              "MinHealthyPercentage": 50,
+              "InstanceWarmup": 60
+            }' \
+            --query 'InstanceRefreshId' \
+            --output text)
+
+          echo "Instance refresh started: $REFRESH_ID"
+
+          for i in {1..30}; do
+            STATUS=$(aws autoscaling describe-instance-refreshes \
+              --auto-scaling-group-name starttech-backend-asg \
+              --instance-refresh-ids $REFRESH_ID \
+              --query 'InstanceRefreshes[0].Status' \
+              --output text)
+            echo "Refresh status: $STATUS"
+            if [ "$STATUS" = "Successful" ]; then
+              echo " Rolling update completed successfully"
+              break
+            elif [ "$STATUS" = "Failed" ] || [ "$STATUS" = "Cancelled" ]; then
+              echo " Rolling update failed: $STATUS"
+              exit 1
+            fi
+            sleep 20
+          done
+
+      - name: Run smoke tests
+        run: |
+          chmod +x scripts/health-check.sh
+          ./scripts/health-check.sh ${{ secrets.ALB_DNS_NAME }}
+
+      - name: Configure CloudWatch log group
+        run: |
+          aws logs create-log-group \
+            --log-group-name /starttech/backend \
+            2>/dev/null || true
+
+          aws logs put-retention-policy \
+            --log-group-name /starttech/backend \
+            --retention-in-days 30
+
+      - name: Notify deployment result
+        if: always()
+        run: |
+          if [ "${{ job.status }}" = "success" ]; then
+            echo " Backend deployed — image: ${{ needs.build.outputs.image_uri }}"
+          else
+            echo " Backend deployment failed"
+          fi
